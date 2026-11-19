@@ -270,7 +270,7 @@ unsafe fn build_controls(state: &mut SettingsState) {
     control(
         hwnd,
         "STATIC",
-        "Ctrl+Shift+средняя кнопка мыши — копировать всё меню целиком.",
+        "Ctrl+Shift+средняя кнопка мыши — копировать всё меню целиком (дополнительный жест).",
         style_static(),
         WINDOW_STYLE(0),
         ID_MENU_HINT,

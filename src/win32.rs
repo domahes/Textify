@@ -268,7 +268,15 @@ pub fn bold_weight() -> i32 {
 
 pub fn copy_to_clipboard(owner: HWND, text: &str) -> bool {
     unsafe {
-        if OpenClipboard(owner).is_err() {
+        let mut opened = false;
+        for _ in 0..10 {
+            if OpenClipboard(owner).is_ok() {
+                opened = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(15));
+        }
+        if !opened {
             return false;
         }
 

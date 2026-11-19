@@ -13,8 +13,8 @@ use windows::Win32::System::Threading::{
     GetCurrentThread, GetCurrentThreadId, SetThreadPriority, THREAD_PRIORITY_TIME_CRITICAL,
 };
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetAsyncKeyState, VK_CONTROL, VK_LBUTTON, VK_LWIN, VK_MBUTTON, VK_MENU, VK_RBUTTON, VK_RWIN,
-    VK_SHIFT,
+    GetAsyncKeyState, VK_CONTROL, VK_LBUTTON, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_LWIN,
+    VK_MBUTTON, VK_MENU, VK_RBUTTON, VK_RCONTROL, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetMessageW, PeekMessageW, PostMessageW, PostThreadMessageW,
@@ -148,13 +148,27 @@ fn hook_thread(
     }
 }
 
+fn is_shift_down() -> bool {
+    key_down(VK_SHIFT.0 as i32) || key_down(VK_LSHIFT.0 as i32) || key_down(VK_RSHIFT.0 as i32)
+}
+
+fn is_ctrl_down() -> bool {
+    key_down(VK_CONTROL.0 as i32) || key_down(VK_LCONTROL.0 as i32) || key_down(VK_RCONTROL.0 as i32)
+}
+
+fn is_alt_down() -> bool {
+    key_down(VK_MENU.0 as i32) || key_down(VK_LMENU.0 as i32) || key_down(VK_RMENU.0 as i32)
+}
+
+fn is_win_down() -> bool {
+    unsafe { GetAsyncKeyState(VK_LWIN.0 as i32) < 0 || GetAsyncKeyState(VK_RWIN.0 as i32) < 0 }
+}
+
 fn modifiers_match(shared: &HookShared) -> bool {
-    let ctrl = key_down(VK_CONTROL.0 as i32);
-    let alt = key_down(VK_MENU.0 as i32);
-    let shift = key_down(VK_SHIFT.0 as i32);
-    let win = unsafe {
-        GetAsyncKeyState(VK_LWIN.0 as i32) < 0 || GetAsyncKeyState(VK_RWIN.0 as i32) < 0
-    };
+    let ctrl = is_ctrl_down();
+    let alt = is_alt_down();
+    let shift = is_shift_down();
+    let win = is_win_down();
 
     ctrl == shared.ctrl && alt == shared.alt && shift == shared.shift && win == shared.win
 }
@@ -163,9 +177,19 @@ fn key_down(vk: i32) -> bool {
     unsafe { GetAsyncKeyState(vk) < 0 }
 }
 
-/// The whole-menu mode is reserved: Ctrl+Shift + middle button.
-fn menu_mode_pressed() -> bool {
-    key_down(VK_CONTROL.0 as i32) && key_down(VK_SHIFT.0 as i32)
+/// The whole-menu mode is Ctrl+Shift + middle button.
+/// But if the user explicitly configured Ctrl+Shift+middle as the main shortcut,
+/// do not hijack it for menu mode.
+fn menu_mode_pressed(shared: &HookShared) -> bool {
+    let is_main_shortcut = shared.button_vk == VK_MBUTTON.0 as u32
+        && shared.ctrl
+        && shared.shift
+        && !shared.alt
+        && !shared.win;
+    if is_main_shortcut {
+        return false;
+    }
+    is_ctrl_down() && is_shift_down() && !is_alt_down() && !is_win_down()
 }
 
 unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
@@ -184,7 +208,7 @@ unsafe extern "system" fn mouse_proc(code: i32, wparam: WPARAM, lparam: LPARAM) 
                 // Special mode first: it is a fixed gesture that must not be
                 // confused with the configurable shortcut.
                 if message == WM_MBUTTONDOWN
-                    && menu_mode_pressed()
+                    && menu_mode_pressed(shared)
                     && !win32::is_excluded(data.pt, &shared.exclude)
                 {
                     shared.pressed.store(false, Ordering::SeqCst);

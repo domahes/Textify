@@ -16,8 +16,11 @@ use windows::Win32::Foundation::{BOOL, HWND, LPARAM, POINT, RECT};
 use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
 use windows::Win32::UI::Accessibility::{
     AccessibleObjectFromPoint, CUIAutomation, IAccessible, IUIAutomation,
-    IUIAutomationLegacyIAccessiblePattern, IUIAutomationValuePattern, WindowFromAccessibleObject,
-    UIA_LegacyIAccessiblePatternId, UIA_ValuePatternId,
+    IUIAutomationElement, IUIAutomationLegacyIAccessiblePattern,
+    IUIAutomationTextPattern, IUIAutomationTextPattern2,
+    IUIAutomationValuePattern, WindowFromAccessibleObject,
+    TextUnit_Line, UIA_LegacyIAccessiblePatternId, UIA_TextPattern2Id,
+    UIA_TextPatternId, UIA_ValuePatternId,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     EnumChildWindows, GetWindowThreadProcessId,
@@ -175,23 +178,108 @@ fn caption_of(hwnd: HWND) -> String {
 // UI Automation
 // ---------------------------------------------------------------------------
 
+fn is_chromium_window(hwnd: HWND) -> bool {
+    if win32::hwnd_is_null(hwnd) {
+        return false;
+    }
+    let class = win32::get_class(hwnd).to_ascii_lowercase();
+    if class.starts_with("chrome_")
+        || class.contains("renderwidgethost")
+        || class.contains("intermediate d3d window")
+    {
+        return true;
+    }
+    let root = win32::get_root(hwnd);
+    if root != hwnd {
+        let root_class = win32::get_class(root).to_ascii_lowercase();
+        return root_class.starts_with("chrome_")
+            || root_class.contains("renderwidgethost")
+            || root_class.contains("intermediate d3d window");
+    }
+    false
+}
+
+fn is_generic_control_name(name: &str) -> bool {
+    let lower = name.trim().to_lowercase();
+    matches!(
+        lower.as_str(),
+        "text editor"
+            | "редактор текста"
+            | "richedit control"
+            | "richedit"
+            | "rich edit"
+            | "edit"
+            | "document"
+            | "документ"
+            | "editor"
+            | "редактор"
+            | "text area"
+            | "поле ввода"
+            | "текстовое поле"
+            | "область текста"
+            | "текстовая область"
+            | "терминал"
+            | "terminal"
+            | "консоль"
+            | "console"
+    )
+}
+
 unsafe fn capture_uia(point: POINT) -> Option<Capture> {
     let automation: IUIAutomation =
         CoCreateInstance(&CUIAutomation, None, CLSCTX_INPROC_SERVER).ok()?;
 
-    let mut element = automation.ElementFromPoint(point).ok()?;
-    // Chromium occasionally returns the correct element only on the second
-    // query; Textify does the same double query.
-    if let Ok(second) = automation.ElementFromPoint(point) {
+    let hwnd_at_point = windows::Win32::UI::WindowsAndMessaging::WindowFromPoint(point);
+    let is_chromium = is_chromium_window(hwnd_at_point);
+
+    let mut element = match automation.ElementFromPoint(point) {
+        Ok(elem) => elem,
+        Err(_) if is_chromium => {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            automation.ElementFromPoint(point).ok()?
+        }
+        Err(_) => return None,
+    };
+
+    let is_chromium = is_chromium
+        || is_chromium_window(element.CurrentNativeWindowHandle().unwrap_or_default());
+
+    // Chromium lazily initializes its accessibility bridge upon the first
+    // query; a brief delay allows the AXTree to populate.
+    if is_chromium {
+        std::thread::sleep(std::time::Duration::from_millis(35));
+        if let Ok(second) = automation.ElementFromPoint(point) {
+            element = second;
+        }
+    } else if let Ok(second) = automation.ElementFromPoint(point) {
         element = second;
     }
 
-    let walker = automation.RawViewWalker().ok()?;
-    let process_id = element.CurrentProcessId().unwrap_or(0);
+    let mut result = walk_uia_tree(&automation, &element, point);
 
-    let mut current = element;
+    if result.is_none() && is_chromium {
+        // If the accessibility tree was still populating on the first pass,
+        // retry once more after another brief pause.
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        if let Ok(retry_element) = automation.ElementFromPoint(point) {
+            result = walk_uia_tree(&automation, &retry_element, point);
+        }
+    }
+
+    result
+}
+
+unsafe fn walk_uia_tree(
+    automation: &IUIAutomation,
+    start: &IUIAutomationElement,
+    point: POINT,
+) -> Option<Capture> {
+    let walker = automation.RawViewWalker().ok()?;
+    let process_id = start.CurrentProcessId().unwrap_or(0);
+
+    let mut current = start.clone();
     for _ in 0..MAX_TREE_DEPTH {
-        let segments = uia_segments(&current);
+        let segments = uia_segments(&current, point);
         if !segments.is_empty() {
             let rect = current.CurrentBoundingRectangle().unwrap_or_default();
             let hwnd = current.CurrentNativeWindowHandle().unwrap_or_default();
@@ -210,28 +298,108 @@ unsafe fn capture_uia(point: POINT) -> Option<Capture> {
     None
 }
 
-unsafe fn uia_segments(element: &windows::Win32::UI::Accessibility::IUIAutomationElement) -> Vec<String> {
+unsafe fn extract_text_pattern(
+    element: &IUIAutomationElement,
+    point: POINT,
+    segments: &mut Vec<String>,
+) {
+    let pattern: Option<IUIAutomationTextPattern> = element
+        .GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId)
+        .ok()
+        .or_else(|| {
+            element
+                .GetCurrentPatternAs::<IUIAutomationTextPattern2>(UIA_TextPattern2Id)
+                .ok()
+                .and_then(|p2| p2.cast().ok())
+        })
+        .or_else(|| {
+            element
+                .GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPattern2Id)
+                .ok()
+        });
+
+    let Some(pattern) = pattern else {
+        return;
+    };
+
+    let doc_text = pattern
+        .DocumentRange()
+        .ok()
+        .and_then(|r| r.GetText(-1).ok())
+        .map(|s| clean_segment(&s.to_string()))
+        .filter(|s| !s.is_empty());
+
+    // If the document is small/medium (<= 60 lines and <= 8192 chars), use it as the
+    // complete text of the control. This avoids truncating multi-line notes or error dialogs,
+    // and avoids duplicating the line at point.
+    if let Some(ref text) = doc_text {
+        if text.lines().count() <= 60 && text.len() <= 8192 {
+            push_fragment(segments, text);
+            return;
+        }
+    }
+
+    // For large documents (e.g. terminal scrollback, large source code, or long web documents),
+    // extract the line under the mouse cursor.
+    if let Ok(range) = pattern.RangeFromPoint(point) {
+        let _ = range.ExpandToEnclosingUnit(TextUnit_Line);
+        if let Ok(line_text) = range.GetText(-1) {
+            let cleaned = clean_segment(&line_text.to_string());
+            if !cleaned.is_empty() {
+                push_fragment(segments, &cleaned);
+                return;
+            }
+        }
+    }
+
+    // If RangeFromPoint did not return text, fall back to the document text if available.
+    if let Some(text) = doc_text {
+        push_fragment(segments, &text);
+    }
+}
+
+unsafe fn uia_segments(
+    element: &IUIAutomationElement,
+    point: POINT,
+) -> Vec<String> {
     let mut segments = Vec::new();
 
+    // 1. Text Pattern (IUIAutomationTextPattern / IUIAutomationTextPattern2)
+    extract_text_pattern(element, point, &mut segments);
+
+    // 2. Value Pattern (if Text Pattern did not provide text)
+    if segments.is_empty() {
+        if let Ok(pattern) =
+            element.GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId)
+        {
+            if let Ok(value) = pattern.CurrentValue() {
+                push_fragment(&mut segments, &value.to_string());
+            }
+        }
+    }
+
+    // 3. CurrentName
     let name = element
         .CurrentName()
         .map(|name| name.to_string())
         .unwrap_or_default();
-    push_fragment(&mut segments, &name);
-
-    if let Ok(pattern) =
-        element.GetCurrentPatternAs::<IUIAutomationValuePattern>(UIA_ValuePatternId)
-    {
-        if let Ok(value) = pattern.CurrentValue() {
-            push_fragment(&mut segments, &value.to_string());
-        }
+    let name_trimmed = name.trim();
+    if segments.is_empty() {
+        push_fragment(&mut segments, name_trimmed);
+    } else if !is_generic_control_name(name_trimmed) {
+        push_fragment(&mut segments, name_trimmed);
     }
 
+    // 4. Legacy IAccessible Pattern
     if let Ok(pattern) = element
         .GetCurrentPatternAs::<IUIAutomationLegacyIAccessiblePattern>(UIA_LegacyIAccessiblePatternId)
     {
         if let Ok(name) = pattern.CurrentName() {
-            push_fragment(&mut segments, &name.to_string());
+            let name_str = name.to_string();
+            let trimmed = name_str.trim();
+            if segments.is_empty() || !is_generic_control_name(trimmed) {
+                push_fragment(&mut segments, trimmed);
+            }
         }
         if let Ok(value) = pattern.CurrentValue() {
             push_fragment(&mut segments, &value.to_string());
@@ -256,12 +424,26 @@ pub(crate) fn push_fragment(segments: &mut Vec<String>, value: &str) {
 // ---------------------------------------------------------------------------
 
 unsafe fn capture_msaa(point: POINT) -> Option<Capture> {
+    let hwnd_at_point = windows::Win32::UI::WindowsAndMessaging::WindowFromPoint(point);
+    let is_chromium = is_chromium_window(hwnd_at_point);
+
     let mut accessible: Option<IAccessible> = None;
     let mut child = VARIANT::new();
-    AccessibleObjectFromPoint(point, &mut accessible, &mut child).ok()?;
+    if AccessibleObjectFromPoint(point, &mut accessible, &mut child).is_err() || accessible.is_none() {
+        if is_chromium {
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            AccessibleObjectFromPoint(point, &mut accessible, &mut child).ok()?;
+        } else {
+            return None;
+        }
+    }
     let mut accessible = accessible?;
 
-    // The same Chromium quirk as above.
+    // Chromium occasionally returns the correct element only on the second
+    // query; allow a brief delay for its accessibility tree to initialize.
+    if is_chromium {
+        std::thread::sleep(std::time::Duration::from_millis(30));
+    }
     let mut second_accessible: Option<IAccessible> = None;
     let mut second_child = VARIANT::new();
     if AccessibleObjectFromPoint(point, &mut second_accessible, &mut second_child).is_ok() {
@@ -440,4 +622,28 @@ unsafe extern "system" fn collect_child_text(hwnd: HWND, lparam: LPARAM) -> BOOL
     }
 
     BOOL(1)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn identifies_generic_control_names() {
+        assert!(is_generic_control_name("Text Editor"));
+        assert!(is_generic_control_name("Редактор текста"));
+        assert!(is_generic_control_name("РЕДАКТОР ТЕКСТА"));
+        assert!(is_generic_control_name("richedit control"));
+        assert!(is_generic_control_name("Edit"));
+        assert!(is_generic_control_name("Document"));
+        assert!(is_generic_control_name("Документ"));
+        assert!(is_generic_control_name("Поле ввода"));
+        assert!(is_generic_control_name("Текстовое поле"));
+        assert!(is_generic_control_name("Терминал"));
+        assert!(is_generic_control_name("Console"));
+
+        assert!(!is_generic_control_name("Текст заметки"));
+        assert!(!is_generic_control_name("My Document.txt"));
+        assert!(!is_generic_control_name("Имя пользователя:"));
+    }
 }

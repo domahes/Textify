@@ -107,6 +107,90 @@ fn captures_static_label_from_a_real_window() {
 }
 
 #[test]
+fn captures_text_from_richedit_control() {
+    unsafe {
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+        let _ = windows::Win32::System::LibraryLoader::LoadLibraryW(w!("msftedit.dll"));
+    }
+
+    let class_name = Box::leak(win32::wide("TextifyRS_LiveRichEdit").into_boxed_slice());
+    unsafe {
+        let class = WNDCLASSW {
+            lpfnWndProc: Some(wnd_proc),
+            hInstance: win32::instance(),
+            lpszClassName: windows::core::PCWSTR(class_name.as_ptr()),
+            ..Default::default()
+        };
+        RegisterClassW(&class);
+    }
+
+    let hwnd = unsafe {
+        CreateWindowExW(
+            WS_EX_TOPMOST,
+            windows::core::PCWSTR(class_name.as_ptr()),
+            w!("Textify RS RichEdit test"),
+            WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+            80,
+            80,
+            420,
+            200,
+            None,
+            None,
+            win32::instance(),
+            None,
+        )
+        .expect("test window")
+    };
+    let richedit = unsafe {
+        CreateWindowExW(
+            WINDOW_EX_STYLE(0),
+            w!("RICHEDIT50W"),
+            w!("Первая строка\r\nВторая строка"),
+            WS_CHILD | WS_VISIBLE | WINDOW_STYLE(4),
+            24,
+            36,
+            360,
+            100,
+            hwnd,
+            None,
+            win32::instance(),
+            None,
+        )
+        .expect("richedit")
+    };
+    unsafe {
+        let _ = ShowWindow(hwnd, SW_SHOW);
+        let _ = SetWindowPos(
+            hwnd,
+            HWND_TOPMOST,
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW,
+        );
+    }
+    pump();
+
+    let point = POINT { x: 140, y: 150 };
+    let capture = capture_at(point, RetrievalMethod::Uia);
+
+    unsafe {
+        let _ = DestroyWindow(richedit);
+        let _ = DestroyWindow(hwnd);
+    }
+
+    let capture = capture.expect("expected captured text from richedit");
+    assert_eq!(capture.method, RetrievalMethod::Uia);
+    assert_eq!(
+        capture.text, "Первая строка\r\nВторая строка",
+        "expected exact multiline capture without duplication or truncation, got: {:?}",
+        capture.text
+    );
+    assert_eq!(capture.segments.len(), 1);
+}
+
+#[test]
 #[ignore = "needs an interactive desktop: it activates a window and opens a real popup menu"]
 fn captures_every_item_of_an_open_menu() {
     unsafe {
