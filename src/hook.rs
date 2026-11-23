@@ -4,9 +4,9 @@
 //! target application can never stall it.
 
 use std::cell::RefCell;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -18,9 +18,9 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     CallNextHookEx, DispatchMessageW, GetMessageW, PeekMessageW, PostMessageW, PostThreadMessageW,
-    SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, HHOOK, MSG,
-    MSLLHOOKSTRUCT, PM_NOREMOVE, WH_MOUSE_LL, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN,
-    WM_MBUTTONUP, WM_QUIT, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_USER,
+    SetWindowsHookExW, TranslateMessage, UnhookWindowsHookEx, HHOOK, MSG, MSLLHOOKSTRUCT,
+    PM_NOREMOVE, WH_MOUSE_LL, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_QUIT,
+    WM_RBUTTONDOWN, WM_RBUTTONUP, WM_USER,
 };
 
 use crate::config::MouseHotkey;
@@ -69,18 +69,26 @@ impl Drop for HookReservation {
 
 struct HookControl {
     cancelled: AtomicBool,
-    thread_id: AtomicU32,
+    thread_id: Mutex<u32>,
 }
 
 impl HookControl {
     fn stop(&self) {
         self.cancelled.store(true, Ordering::SeqCst);
-        let thread_id = self.thread_id.load(Ordering::SeqCst);
-        if thread_id != 0 {
+        let thread_id = self.thread_id.lock().unwrap();
+        if *thread_id != 0 {
             unsafe {
-                let _ = PostThreadMessageW(thread_id, WM_QUIT, WPARAM(0), LPARAM(0));
+                let _ = PostThreadMessageW(*thread_id, WM_QUIT, WPARAM(0), LPARAM(0));
             }
         }
+    }
+}
+
+struct ThreadIdGuard<'a>(&'a HookControl);
+
+impl Drop for ThreadIdGuard<'_> {
+    fn drop(&mut self) {
+        *self.0.thread_id.lock().unwrap() = 0;
     }
 }
 
@@ -101,7 +109,7 @@ impl MouseHook {
         let reservation = HookReservation::acquire()?;
         let control = Arc::new(HookControl {
             cancelled: AtomicBool::new(false),
-            thread_id: AtomicU32::new(0),
+            thread_id: Mutex::new(0),
         });
         let thread_control = Arc::clone(&control);
         let (ready_tx, ready_rx) = mpsc::channel();
@@ -110,6 +118,7 @@ impl MouseHook {
         let thread = thread::Builder::new()
             .name("textify-rs-mouse-hook".to_string())
             .spawn(move || {
+                let thread_id_guard = ThreadIdGuard(&thread_control);
                 hook_thread(
                     HWND(main_bits as _),
                     notify,
@@ -118,6 +127,7 @@ impl MouseHook {
                     ready_tx,
                     &thread_control,
                 );
+                drop(thread_id_guard);
                 drop(reservation);
                 let _ = done_tx.send(());
             })
@@ -139,8 +149,8 @@ impl MouseHook {
     }
 
     pub fn shutdown(&mut self) {
-        self.control.stop();
         if let Some(thread) = self.thread.take() {
+            self.control.stop();
             if self.done.recv_timeout(STOP_TIMEOUT).is_ok() {
                 let _ = thread.join();
             }
@@ -167,7 +177,7 @@ fn hook_thread(
         let mut message = MSG::default();
         let _ = PeekMessageW(&mut message, None, WM_USER, WM_USER, PM_NOREMOVE);
 
-        control.thread_id.store(GetCurrentThreadId(), Ordering::SeqCst);
+        *control.thread_id.lock().unwrap() = GetCurrentThreadId();
 
         let shared = HookShared {
             main,
@@ -217,7 +227,9 @@ fn is_shift_down() -> bool {
 }
 
 fn is_ctrl_down() -> bool {
-    key_down(VK_CONTROL.0 as i32) || key_down(VK_LCONTROL.0 as i32) || key_down(VK_RCONTROL.0 as i32)
+    key_down(VK_CONTROL.0 as i32)
+        || key_down(VK_LCONTROL.0 as i32)
+        || key_down(VK_RCONTROL.0 as i32)
 }
 
 fn is_alt_down() -> bool {
@@ -369,7 +381,7 @@ mod tests {
     fn stop_before_queue_creation_sets_cancellation() {
         let control = HookControl {
             cancelled: AtomicBool::new(false),
-            thread_id: AtomicU32::new(0),
+            thread_id: Mutex::new(0),
         };
         control.stop();
         assert!(control.cancelled.load(Ordering::SeqCst));
