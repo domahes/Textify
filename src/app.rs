@@ -9,26 +9,26 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use windows::core::w;
 use windows::core::PCWSTR;
 use windows::Win32::Foundation::{
-    CloseHandle, GetLastError, HWND, LPARAM, LRESULT, POINT, WPARAM, ERROR_ALREADY_EXISTS,
+    CloseHandle, GetLastError, ERROR_ALREADY_EXISTS, HWND, LPARAM, LRESULT, POINT, WPARAM,
 };
-use windows::Win32::UI::WindowsAndMessaging::HICON;
 use windows::Win32::System::Com::{CoInitializeEx, CoUninitialize, COINIT_APARTMENTTHREADED};
 use windows::Win32::System::Threading::CreateMutexW;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS, MOD_ALT, MOD_CONTROL, MOD_NOREPEAT,
     MOD_SHIFT, MOD_WIN,
 };
+use windows::Win32::UI::WindowsAndMessaging::HICON;
 use windows::Win32::UI::WindowsAndMessaging::{
     CreateWindowExW, DefWindowProcW, DestroyIcon, DestroyWindow, DispatchMessageW, FindWindowW,
     GetMessageW, LoadCursorW, PostMessageW, PostQuitMessage, RegisterClassW,
-    RegisterWindowMessageW, TranslateMessage, IDC_ARROW, MSG, WINDOW_EX_STYLE, WM_CLOSE, WM_DESTROY,
-    WM_HOTKEY, WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSW, WS_OVERLAPPED,
+    RegisterWindowMessageW, TranslateMessage, IDC_ARROW, MSG, WINDOW_EX_STYLE, WM_CLOSE,
+    WM_DESTROY, WM_HOTKEY, WM_LBUTTONUP, WM_RBUTTONUP, WNDCLASSW, WS_OVERLAPPED,
 };
 
-use crate::capture::{capture_at, Capture};
+use crate::capture::{Capture, CaptureRequest};
+use crate::capture_worker::CaptureWorker;
 use crate::config::{set_run_at_login, Config, KeyHotkey};
 use crate::hook::{self, MouseHook};
-use crate::menu;
 use crate::result;
 use crate::settings;
 use crate::text::join_segments;
@@ -38,6 +38,7 @@ use crate::win32;
 pub const WM_APP_TRAY: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 1;
 pub const WM_APP_CAPTURE: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 2;
 pub const WM_APP_SHOW: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 3;
+const WM_APP_CAPTURE_DONE: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 4;
 
 const CLASS_MAIN: &str = "TextifyRS_Main";
 const HOTKEY_ID: i32 = 1;
@@ -51,6 +52,9 @@ struct AppState {
     ini_path: PathBuf,
     icon: HICON,
     hook: Option<MouseHook>,
+    capture_worker: Option<CaptureWorker>,
+    capture_id: u64,
+    pending_capture: Option<(u64, POINT, Config)>,
     hotkey_registered: bool,
     tray_added: bool,
     result: HWND,
@@ -68,16 +72,23 @@ pub fn main_entry() {
         return;
     }
 
-    let hidden = args.iter().any(|arg| arg == "-hidewnd" || arg == "--hidden");
+    let hidden = args
+        .iter()
+        .any(|arg| arg == "-hidewnd" || arg == "--hidden");
 
     let mutex = unsafe { CreateMutexW(None, false, w!("Local\\TextifyRS.SingleInstance")) };
     let Ok(mutex) = mutex else {
-        win32::show_error(HWND::default(), "Не удалось создать мьютекс единственного экземпляра.", "Textify RS");
+        win32::show_error(
+            HWND::default(),
+            "Не удалось создать мьютекс единственного экземпляра.",
+            "Textify RS",
+        );
         return;
     };
     if unsafe { GetLastError() } == ERROR_ALREADY_EXISTS {
         let class_name = win32::wide(CLASS_MAIN);
-        let existing = unsafe { FindWindowW(PCWSTR(class_name.as_ptr()), None).unwrap_or_default() };
+        let existing =
+            unsafe { FindWindowW(PCWSTR(class_name.as_ptr()), None).unwrap_or_default() };
         if !win32::hwnd_is_null(existing) {
             let _ = unsafe { PostMessageW(existing, WM_APP_SHOW, WPARAM(0), LPARAM(0)) };
         }
@@ -114,7 +125,11 @@ pub fn main_entry() {
         )
     };
     let Ok(hwnd) = hwnd else {
-        win32::show_error(HWND::default(), "Не удалось создать служебное окно.", "Textify RS");
+        win32::show_error(
+            HWND::default(),
+            "Не удалось создать служебное окно.",
+            "Textify RS",
+        );
         return;
     };
 
@@ -130,6 +145,9 @@ pub fn main_entry() {
             ini_path: ini_path.clone(),
             icon,
             hook: None,
+            capture_worker: CaptureWorker::start(hwnd, WM_APP_CAPTURE_DONE),
+            capture_id: 0,
+            pending_capture: None,
             hotkey_registered: false,
             tray_added: false,
             result: HWND::default(),
@@ -229,17 +247,20 @@ fn show_settings() {
 }
 
 fn capture_now(point: POINT, menu_mode: bool) {
-    let (cfg, owner, icon, result_hwnd) = match with_state(|state| {
-        (state.cfg.clone(), state.hwnd, state.icon, state.result)
-    }) {
-        Some(value) => value,
-        None => return,
-    };
+    let (cfg, owner, icon, result_hwnd) =
+        match with_state(|state| (state.cfg.clone(), state.hwnd, state.icon, state.result)) {
+            Some(value) => value,
+            None => return,
+        };
 
     let target = unsafe {
         let window = windows::Win32::UI::WindowsAndMessaging::WindowFromPoint(point);
         win32::get_root(window)
     };
+    with_state(|state| {
+        state.capture_id = state.capture_id.wrapping_add(1);
+        state.pending_capture = None;
+    });
     if !win32::hwnd_is_null(result_hwnd) && target == result_hwnd {
         let _ = unsafe { DestroyWindow(result_hwnd) };
         with_state(|state| state.result = HWND::default());
@@ -251,22 +272,64 @@ fn capture_now(point: POINT, menu_mode: bool) {
         with_state(|state| state.result = HWND::default());
     }
 
-    // The whole-menu mode is a best effort: when the point is not over a menu,
-    // fall back to the ordinary single-element capture.
-    let capture = if menu_mode {
-        menu::capture_menu_at(point).or_else(|| capture_at(point, cfg.retrieval))
-    } else {
-        capture_at(point, cfg.retrieval)
+    let request = CaptureRequest {
+        point,
+        method: cfg.retrieval,
+        menu: menu_mode,
     };
+    let submitted = with_state(|state| {
+        let id = state.capture_id;
+        if state
+            .capture_worker
+            .as_ref()
+            .is_some_and(|worker| worker.submit(id, request))
+        {
+            state.pending_capture = Some((id, point, cfg.clone()));
+            true
+        } else {
+            false
+        }
+    })
+    .unwrap_or(false);
+    if !submitted {
+        show_capture(None, point, &cfg, owner, icon);
+    }
+}
 
+fn show_capture(capture: Option<Capture>, point: POINT, cfg: &Config, owner: HWND, icon: HICON) {
     let (capture, is_placeholder) = match capture {
         Some(capture) => (capture, false),
-        None => (placeholder(point, &cfg), true),
+        None => (placeholder(point, cfg), true),
     };
     // Nothing useful to copy when all we could show was the "no text" hint.
     let auto_copy = cfg.auto_copy && !is_placeholder;
-    if let Some(hwnd) = result::show(owner, icon, &capture, &cfg, auto_copy) {
+    if let Some(hwnd) = result::show(owner, icon, &capture, cfg, auto_copy) {
         with_state(|state| state.result = hwnd);
+    }
+}
+
+fn capture_finished() {
+    loop {
+        let completed = with_state(|state| {
+            let (id, capture) = state.capture_worker.as_ref()?.try_result()?;
+            let pending = if state
+                .pending_capture
+                .as_ref()
+                .is_some_and(|pending| pending.0 == id)
+            {
+                state.pending_capture.take()
+            } else {
+                None
+            };
+            Some((capture, pending, state.hwnd, state.icon))
+        })
+        .flatten();
+        let Some((capture, pending, owner, icon)) = completed else {
+            break;
+        };
+        if let Some((_, point, cfg)) = pending {
+            show_capture(capture, point, &cfg, owner, icon);
+        }
     }
 }
 
@@ -296,7 +359,9 @@ fn placeholder(point: POINT, cfg: &Config) -> Capture {
 fn install_shortcuts(state: &mut AppState) -> Vec<String> {
     let mut errors = Vec::new();
 
-    state.hook = None;
+    if let Some(mut hook) = state.hook.take() {
+        hook.shutdown();
+    }
     state.hook = MouseHook::install(
         state.hwnd,
         WM_APP_CAPTURE,
@@ -491,6 +556,10 @@ unsafe extern "system" fn main_wnd_proc(
             capture_now(hook::unpack_point(lparam.0), wparam.0 == hook::CAPTURE_MENU);
             LRESULT(0)
         }
+        WM_APP_CAPTURE_DONE => {
+            capture_finished();
+            LRESULT(0)
+        }
         WM_APP_SHOW => {
             show_settings();
             LRESULT(0)
@@ -502,7 +571,14 @@ unsafe extern "system" fn main_wnd_proc(
             LRESULT(0)
         }
         WM_CLOSE => {
-            let (settings, result) = with_state(|state| (state.settings, state.result)).unwrap_or_default();
+            with_state(|state| {
+                state.pending_capture = None;
+                if let Some(worker) = &state.capture_worker {
+                    worker.shutdown();
+                }
+            });
+            let (settings, result) =
+                with_state(|state| (state.settings, state.result)).unwrap_or_default();
             if !win32::hwnd_is_null(settings) {
                 let _ = DestroyWindow(settings);
             }
@@ -518,7 +594,8 @@ unsafe extern "system" fn main_wnd_proc(
         }
         other if other == TASKBAR_CREATED.load(Ordering::SeqCst) && other != 0 => {
             with_state(|state| {
-                state.tray_added = tray::add(state.hwnd, state.icon, &tray_tip(&state.cfg), WM_APP_TRAY);
+                state.tray_added =
+                    tray::add(state.hwnd, state.icon, &tray_tip(&state.cfg), WM_APP_TRAY);
             });
             LRESULT(0)
         }
@@ -548,18 +625,32 @@ fn debug_capture(args: &[String]) {
 
     // `--menu` exercises the whole-menu special mode from the console.
     let menu_mode = args.iter().any(|arg| arg == "--menu");
-    let capture = if menu_mode {
-        menu::capture_menu_at(point).or_else(|| capture_at(point, method))
-    } else {
-        capture_at(point, method)
-    };
+    let capture = CaptureRequest {
+        point,
+        method,
+        menu: menu_mode,
+    }
+    .execute();
 
     match capture {
         Some(capture) => {
-            println!("mode: {}", if capture.menu { "всё меню" } else { "элемент" });
+            println!(
+                "mode: {}",
+                if capture.menu {
+                    "всё меню"
+                } else {
+                    "элемент"
+                }
+            );
             println!("method: {}", capture.method.label_ru());
             println!("title: {}", capture.title);
-            println!("rect: {},{} {}x{}", capture.rect.left, capture.rect.top, win32::rect_width(&capture.rect), win32::rect_height(&capture.rect));
+            println!(
+                "rect: {},{} {}x{}",
+                capture.rect.left,
+                capture.rect.top,
+                win32::rect_width(&capture.rect),
+                win32::rect_height(&capture.rect)
+            );
             println!("---");
             println!("{}", capture.text);
         }
@@ -569,5 +660,3 @@ fn debug_capture(args: &[String]) {
     }
     unsafe { CoUninitialize() };
 }
-
-

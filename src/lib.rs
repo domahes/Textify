@@ -7,12 +7,13 @@
 
 pub mod app;
 pub mod capture;
+mod capture_worker;
 
-#[cfg(test)]
-mod live_capture;
 pub mod config;
 pub mod hook;
 pub mod icon_art;
+#[cfg(test)]
+mod live_capture;
 pub mod menu;
 pub mod result;
 pub mod settings;

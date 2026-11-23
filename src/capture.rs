@@ -15,16 +15,12 @@ use windows::core::{Interface, VARIANT};
 use windows::Win32::Foundation::{BOOL, HWND, LPARAM, POINT, RECT};
 use windows::Win32::System::Com::{CoCreateInstance, CLSCTX_INPROC_SERVER};
 use windows::Win32::UI::Accessibility::{
-    AccessibleObjectFromPoint, CUIAutomation, IAccessible, IUIAutomation,
-    IUIAutomationElement, IUIAutomationLegacyIAccessiblePattern,
-    IUIAutomationTextPattern, IUIAutomationTextPattern2,
-    IUIAutomationValuePattern, WindowFromAccessibleObject,
-    TextUnit_Line, UIA_LegacyIAccessiblePatternId, UIA_TextPattern2Id,
-    UIA_TextPatternId, UIA_ValuePatternId,
+    AccessibleObjectFromPoint, CUIAutomation, IAccessible, IUIAutomation, IUIAutomationElement,
+    IUIAutomationLegacyIAccessiblePattern, IUIAutomationTextPattern, IUIAutomationTextPattern2,
+    IUIAutomationValuePattern, TextUnit_Line, UIA_LegacyIAccessiblePatternId, UIA_TextPattern2Id,
+    UIA_TextPatternId, UIA_ValuePatternId, WindowFromAccessibleObject,
 };
-use windows::Win32::UI::WindowsAndMessaging::{
-    EnumChildWindows, GetWindowThreadProcessId,
-};
+use windows::Win32::UI::WindowsAndMessaging::{EnumChildWindows, GetWindowThreadProcessId};
 
 use crate::config::RetrievalMethod;
 use crate::text::{clean_segment, dedupe_segments, join_segments};
@@ -51,6 +47,31 @@ pub struct Capture {
     /// True when the whole menu was captured (special Ctrl+Shift+click mode)
     /// rather than the single element under the cursor.
     pub menu: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct CaptureRequest {
+    pub point: POINT,
+    pub method: RetrievalMethod,
+    pub menu: bool,
+}
+
+impl CaptureRequest {
+    pub fn execute(self) -> Option<Capture> {
+        self.execute_with(crate::menu::capture_menu_at, capture_at)
+    }
+
+    fn execute_with(
+        self,
+        menu: impl FnOnce(POINT) -> Option<Capture>,
+        normal: impl FnOnce(POINT, RetrievalMethod) -> Option<Capture>,
+    ) -> Option<Capture> {
+        if self.menu {
+            menu(self.point).or_else(|| normal(self.point, self.method))
+        } else {
+            normal(self.point, self.method)
+        }
+    }
 }
 
 /// Captures the text at `point` using the requested retrieval strategy.
@@ -171,7 +192,9 @@ pub(crate) fn window_title(hwnd: HWND) -> String {
 /// hosted windows answer WM_GETTEXT with a lone NUL, which would otherwise
 /// look like a non-empty title.
 fn caption_of(hwnd: HWND) -> String {
-    win32::get_text(hwnd).replace('\0', "").replace(['\r', '\n'], " ")
+    win32::get_text(hwnd)
+        .replace('\0', "")
+        .replace(['\r', '\n'], " ")
 }
 
 // ---------------------------------------------------------------------------
@@ -241,8 +264,8 @@ unsafe fn capture_uia(point: POINT) -> Option<Capture> {
         Err(_) => return None,
     };
 
-    let is_chromium = is_chromium
-        || is_chromium_window(element.CurrentNativeWindowHandle().unwrap_or_default());
+    let is_chromium =
+        is_chromium || is_chromium_window(element.CurrentNativeWindowHandle().unwrap_or_default());
 
     // Chromium lazily initializes its accessibility bridge upon the first
     // query; a brief delay allows the AXTree to populate.
@@ -358,10 +381,7 @@ unsafe fn extract_text_pattern(
     }
 }
 
-unsafe fn uia_segments(
-    element: &IUIAutomationElement,
-    point: POINT,
-) -> Vec<String> {
+unsafe fn uia_segments(element: &IUIAutomationElement, point: POINT) -> Vec<String> {
     let mut segments = Vec::new();
 
     // 1. Text Pattern (IUIAutomationTextPattern / IUIAutomationTextPattern2)
@@ -391,9 +411,9 @@ unsafe fn uia_segments(
     }
 
     // 4. Legacy IAccessible Pattern
-    if let Ok(pattern) = element
-        .GetCurrentPatternAs::<IUIAutomationLegacyIAccessiblePattern>(UIA_LegacyIAccessiblePatternId)
-    {
+    if let Ok(pattern) = element.GetCurrentPatternAs::<IUIAutomationLegacyIAccessiblePattern>(
+        UIA_LegacyIAccessiblePatternId,
+    ) {
         if let Ok(name) = pattern.CurrentName() {
             let name_str = name.to_string();
             let trimmed = name_str.trim();
@@ -429,7 +449,9 @@ unsafe fn capture_msaa(point: POINT) -> Option<Capture> {
 
     let mut accessible: Option<IAccessible> = None;
     let mut child = VARIANT::new();
-    if AccessibleObjectFromPoint(point, &mut accessible, &mut child).is_err() || accessible.is_none() {
+    if AccessibleObjectFromPoint(point, &mut accessible, &mut child).is_err()
+        || accessible.is_none()
+    {
         if is_chromium {
             std::thread::sleep(std::time::Duration::from_millis(40));
             AccessibleObjectFromPoint(point, &mut accessible, &mut child).ok()?;
@@ -610,10 +632,8 @@ unsafe extern "system" fn collect_child_text(hwnd: HWND, lparam: LPARAM) -> BOOL
     let collected = &mut *(lparam.0 as *mut Vec<String>);
     let class = win32::get_class(hwnd).to_ascii_lowercase();
 
-    let interesting = class == "static"
-        || class == "edit"
-        || class.starts_with("richedit")
-        || class == "syslink";
+    let interesting =
+        class == "static" || class == "edit" || class.starts_with("richedit") || class == "syslink";
     if interesting {
         let text = win32::get_text(hwnd);
         if !text.trim().is_empty() {
@@ -627,6 +647,58 @@ unsafe extern "system" fn collect_child_text(hwnd: HWND, lparam: LPARAM) -> BOOL
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn request_preserves_normal_and_menu_fallback_selection() {
+        let point = POINT { x: 12, y: -3 };
+        let request = CaptureRequest {
+            point,
+            method: RetrievalMethod::Msaa,
+            menu: false,
+        };
+        request.execute_with(
+            |_| panic!("normal capture must not try the menu provider"),
+            |actual, method| {
+                assert_eq!(
+                    (actual.x, actual.y, method),
+                    (12, -3, RetrievalMethod::Msaa)
+                );
+                None
+            },
+        );
+        CaptureRequest {
+            menu: true,
+            ..request
+        }
+        .execute_with(
+            |_| None,
+            |actual, method| {
+                assert_eq!(
+                    (actual.x, actual.y, method),
+                    (12, -3, RetrievalMethod::Msaa)
+                );
+                None
+            },
+        );
+        let captured = Capture {
+            text: "menu".into(),
+            segments: vec!["menu".into()],
+            rect: RECT::default(),
+            hwnd: HWND::default(),
+            title: String::new(),
+            method: RetrievalMethod::Uia,
+            menu: true,
+        };
+        let result = CaptureRequest {
+            menu: true,
+            ..request
+        }
+        .execute_with(
+            |_| Some(captured),
+            |_, _| panic!("successful menu capture must not fall back"),
+        );
+        assert!(result.unwrap().menu);
+    }
 
     #[test]
     fn identifies_generic_control_names() {
