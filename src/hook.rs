@@ -133,12 +133,8 @@ impl MouseHook {
             })
             .ok()?;
 
-        match ready_rx.recv_timeout(STOP_TIMEOUT) {
-            Ok(true) => {}
-            _ => {
-                control.stop();
-                return None;
-            }
+        if !wait_for_startup(&ready_rx, &control, STOP_TIMEOUT) {
+            return None;
         }
 
         Some(Self {
@@ -155,6 +151,19 @@ impl MouseHook {
                 let _ = thread.join();
             }
         }
+    }
+}
+
+fn wait_for_startup(
+    ready: &mpsc::Receiver<bool>,
+    control: &HookControl,
+    timeout: Duration,
+) -> bool {
+    if matches!(ready.recv_timeout(timeout), Ok(true)) {
+        true
+    } else {
+        control.stop();
+        false
     }
 }
 
@@ -384,6 +393,21 @@ mod tests {
             thread_id: Mutex::new(0),
         };
         control.stop();
+        assert!(control.cancelled.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn startup_timeout_cancels_without_waiting_for_thread() {
+        let control = HookControl {
+            cancelled: AtomicBool::new(false),
+            thread_id: Mutex::new(0),
+        };
+        let (_ready_tx, ready_rx) = mpsc::channel();
+        assert!(!wait_for_startup(
+            &ready_rx,
+            &control,
+            Duration::from_millis(10)
+        ));
         assert!(control.cancelled.load(Ordering::SeqCst));
     }
 
